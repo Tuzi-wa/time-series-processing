@@ -105,7 +105,7 @@ def download_with_fallback(candidates, start="2000-01-01", end=None, interval="1
 
 
 # 入口参数与下载
-candidates = ["AAPL", "GLD", "GC=F"]
+candidates = ["GLD"]
 start_date = "2000-01-01"
 interval = "1d"
 
