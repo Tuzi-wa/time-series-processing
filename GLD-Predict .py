@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
+import statsmodels.api as sm
 
 print("ENV VERSIONS -> numpy:", np.__version__)
 try:
@@ -115,6 +116,18 @@ print(f"使用数据源：{src}，ticker：{ticker}，样本数：{len(df)}")
 price_col = "Adj Close" if "Adj Close" in df.columns else "Close"
 ts = df[price_col].dropna()
 
+# =========================
+# Figure 1: Full sample time series (Data section)
+# =========================
+plt.figure()
+plt.plot(ts.index, ts.values, label=f'{ticker} price')
+plt.title(f'{ticker} full sample price series')
+plt.xlabel('Date')
+plt.ylabel('Price')
+plt.legend()
+plt.tight_layout()
+plt.show()
+
 # ⚠️ 改进: Prophet 可以处理非连续时间序列，不需要强制转换为日频率并填充。
 # 移除这一步可以避免对非交易日价格进行不必要的假设。
 # ts = ts.asfreq("D").ffill() 
@@ -141,6 +154,27 @@ rmse = np.sqrt(((test - rw_preds) ** 2).mean())
 # ⚠️ 修复: 将 Series 转换为浮点数再格式化。
 print(f"RW baseline MAE={mae.item():.6f}, RMSE={rmse.item():.6f}")
 
+# ARIMA 模型（作为统计型备选模型）
+arima_order = (1, 1, 1)  # 可以在报告中说明通过 AIC/BIC 或试验选择
+hist_arima = train.copy()
+arima_preds_list = []
+
+for t in test.index:
+    # 每一步用当前可用样本重新估计 ARIMA，并做一步预测
+    arima_model = sm.tsa.ARIMA(hist_arima, order=arima_order)
+    arima_res = arima_model.fit()
+    forecast = arima_res.forecast(steps=1).iloc[0]
+    arima_preds_list.append(float(forecast))
+    # 将真实值加入样本，递归前进
+    hist_arima.loc[t] = test.loc[t]
+
+arima_preds = pd.Series(arima_preds_list, index=test.index)
+
+diff_arima = test.values - arima_preds.values
+mae_arima = np.mean(np.abs(diff_arima))
+rmse_arima = np.sqrt(np.mean(diff_arima ** 2))
+print(f"ARIMA{arima_order} MAE={mae_arima.item():.6f}, RMSE={rmse_arima.item():.6f}")
+
 # 如可用，计算 Prophet 的滚动一步预测
 prophet_preds = None
 if HAS_PROPHET:
@@ -164,15 +198,19 @@ if HAS_PROPHET:
         hist.loc[t] = test.loc[t]
 
     prophet_preds = pd.Series(prophet_preds_list, index=test.index)
-    mae_pr = (test - prophet_preds).abs().mean()
-    rmse_pr = np.sqrt(((test - prophet_preds) ** 2).mean())
+    diff_pr = test.values - prophet_preds.values
+    mae_pr = np.mean(np.abs(diff_pr))
+    rmse_pr = np.sqrt(np.mean(diff_pr ** 2))
     # ⚠️ 修复: 将 Series 转换为浮点数再格式化。
     print(f"Prophet MAE={mae_pr.item():.6f}, RMSE={rmse_pr.item():.6f}")
 
-# 绘图
+# =========================
+# Figure 2: Combined forecasts vs Actual (Results section)
+# =========================
 plt.figure()
 plt.plot(test.index, test.values, label='Actual')
 plt.plot(test.index, rw_preds.values, label='RW (benchmark)')
+plt.plot(test.index, arima_preds.values, label=f'ARIMA{arima_order}')
 if prophet_preds is not None:
     plt.plot(test.index, prophet_preds.values, label='Prophet')
 plt.title(f'{ticker} one-step forecasts (test set)')
@@ -182,10 +220,40 @@ plt.legend()
 plt.tight_layout()
 plt.show()
 
+# =========================
+# Figure 3: ARIMA vs Actual (Appendix)
+# =========================
+plt.figure()
+plt.plot(test.index, test.values, label='Actual')
+plt.plot(test.index, arima_preds.values, label=f'ARIMA{arima_order}')
+plt.title(f'{ticker} ARIMA vs Actual (test set)')
+plt.xlabel('Date')
+plt.ylabel('Price')
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+if prophet_preds is not None:
+    # =========================
+    # Figure 4: Prophet vs Actual (Appendix)
+    # =========================
+    plt.figure()
+    plt.plot(test.index, test.values, label='Actual')
+    plt.plot(test.index, prophet_preds.values, label='Prophet')
+    plt.title(f'{ticker} Prophet vs Actual (test set)')
+    plt.xlabel('Date')
+    plt.ylabel('Price')
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
 # 汇总指标输出
 metrics = {
     'RW_MAE': float(mae),
-    'RW_RMSE': float(rmse)
+    'RW_RMSE': float(rmse),
+    'ARIMA_MAE': float(mae_arima),
+    'ARIMA_RMSE': float(rmse_arima),
 }
 if prophet_preds is not None:
     metrics.update({
