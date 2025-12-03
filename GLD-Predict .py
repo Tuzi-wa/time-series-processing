@@ -134,6 +134,7 @@ plt.legend()
 plt.tight_layout()
 plt.show()
 
+
 # ⚠️ 改进: Prophet 可以处理非连续时间序列，不需要强制转换为日频率并填充。
 # 移除这一步可以避免对非交易日价格进行不必要的假设。
 # ts = ts.asfreq("D").ffill() 
@@ -183,6 +184,16 @@ try:
 except Exception as e:
     print("VIX 下载失败:", e)
 
+# S&P 500 index (^GSPC)
+try:
+    _, gspc_df, _ = download_with_fallback(
+        ["^GSPC"], start=start_date, end=None, interval=interval
+    )
+    gspc_price_col = "Adj Close" if "Adj Close" in gspc_df.columns else "Close"
+    macro_series["GSPC"] = gspc_df[gspc_price_col].reindex(ts.index).ffill()
+except Exception as e:
+    print("GSPC 下载失败:", e)
+
 # Real rate: 10-year TIPS real yield (DFII10 from FRED)
 if HAS_FRED:
     try:
@@ -194,7 +205,7 @@ if HAS_FRED:
 
 # 组装外生变量矩阵 exog
 exog_list = []
-for name in ["DXY", "TNX", "VIX", "RealRate"]:
+for name in ["DXY", "TNX", "VIX", "RealRate", "GSPC"]:
     if name in macro_series:
         s = macro_series[name].copy()
         s.name = name
@@ -208,6 +219,43 @@ else:
     exog = None
     exog_train = None
     exog_test = None
+
+
+# =========================
+# Figure 1b: Macro Drivers Overview (Data section)
+#   1b-1: Core macro drivers (DXY, TNX, GSPC, RealRate)
+#   1b-2: VIX alone (high-volatility factor)
+# =========================
+if macro_series:
+    # 合并所有宏观因子并按列标准化
+    macro_df = pd.concat(macro_series.values(), axis=1)
+    macro_df.columns = list(macro_series.keys())
+    # 使用按列标准化，避免 pandas 在 std 上的递归问题
+    macro_norm = macro_df.apply(lambda s: (s - s.mean()) / s.std())
+
+    # ---- Figure 1b-1: 核心宏观因子（波动较平稳）----
+    core_cols = [c for c in ["DXY", "TNX", "GSPC", "RealRate"] if c in macro_norm.columns]
+    if core_cols:
+        plt.figure(figsize=(10, 6))
+        for col in core_cols:
+            plt.plot(macro_norm.index, macro_norm[col], label=col)
+        plt.title('Macro Drivers (Core factors, standardized)')
+        plt.xlabel('Date')
+        plt.ylabel('Standardized value (z-score)')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    # ---- Figure 1b-2: 高波动因子 VIX 单独展示 ----
+    if "VIX" in macro_norm.columns:
+        plt.figure(figsize=(10, 4))
+        plt.plot(macro_norm.index, macro_norm["VIX"], label="VIX")
+        plt.title('VIX (standardized)')
+        plt.xlabel('Date')
+        plt.ylabel('Standardized value (z-score)')
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
 
 # 随机游走基准：y_hat_t = y_{t-1}
 anchor = train.iloc[[-1]]
