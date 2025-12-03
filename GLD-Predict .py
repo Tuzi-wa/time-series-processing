@@ -7,6 +7,12 @@ import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
 import statsmodels.api as sm
+try:
+    from pandas_datareader import data as web
+    HAS_FRED = True
+except Exception:
+    HAS_FRED = False
+    print("pandas_datareader/FRED 不可用，RealRate 将被跳过。")
 
 print("ENV VERSIONS -> numpy:", np.__version__)
 try:
@@ -142,6 +148,67 @@ train, test = ts.iloc[:split], ts.iloc[split:]
 if test.empty:
     raise ValueError("测试集为空，请调整时间范围或切分比例。")
 
+# =========================
+# 宏观因子：DXY, TNX, VIX, RealRate (DFII10 from FRED)
+# =========================
+macro_series = {}
+
+# Dollar index (DXY)
+try:
+    _, dxy_df, _ = download_with_fallback(
+        ["DX-Y.NYB", "DXY"], start=start_date, end=None, interval=interval
+    )
+    dxy_price_col = "Adj Close" if "Adj Close" in dxy_df.columns else "Close"
+    macro_series["DXY"] = dxy_df[dxy_price_col].reindex(ts.index).ffill()
+except Exception as e:
+    print("DXY 下载失败:", e)
+
+# 10Y nominal yield (TNX)
+try:
+    _, tnx_df, _ = download_with_fallback(
+        ["^TNX"], start=start_date, end=None, interval=interval
+    )
+    tnx_price_col = "Adj Close" if "Adj Close" in tnx_df.columns else "Close"
+    macro_series["TNX"] = tnx_df[tnx_price_col].reindex(ts.index).ffill()
+except Exception as e:
+    print("TNX 下载失败:", e)
+
+# VIX index
+try:
+    _, vix_df, _ = download_with_fallback(
+        ["^VIX"], start=start_date, end=None, interval=interval
+    )
+    vix_price_col = "Adj Close" if "Adj Close" in vix_df.columns else "Close"
+    macro_series["VIX"] = vix_df[vix_price_col].reindex(ts.index).ffill()
+except Exception as e:
+    print("VIX 下载失败:", e)
+
+# Real rate: 10-year TIPS real yield (DFII10 from FRED)
+if HAS_FRED:
+    try:
+        rr = web.DataReader("DFII10", "fred", start_date)
+        rr_series = rr.iloc[:, 0].reindex(ts.index).ffill()
+        macro_series["RealRate"] = rr_series
+    except Exception as e:
+        print("RealRate (DFII10) 下载失败:", e)
+
+# 组装外生变量矩阵 exog
+exog_list = []
+for name in ["DXY", "TNX", "VIX", "RealRate"]:
+    if name in macro_series:
+        s = macro_series[name].copy()
+        s.name = name
+        exog_list.append(s)
+
+if exog_list:
+    exog = pd.concat(exog_list, axis=1)
+    exog_train = exog.iloc[:split]
+    exog_test = exog.iloc[split:]
+else:
+    exog = None
+    exog_train = None
+    exog_test = None
+
 # 随机游走基准：y_hat_t = y_{t-1}
 anchor = train.iloc[[-1]]
 series_for_pred = pd.concat([anchor, test])
@@ -174,6 +241,32 @@ diff_arima = test.values - arima_preds.values
 mae_arima = np.mean(np.abs(diff_arima))
 rmse_arima = np.sqrt(np.mean(diff_arima ** 2))
 print(f"ARIMA{arima_order} MAE={mae_arima.item():.6f}, RMSE={rmse_arima.item():.6f}")
+
+# ARIMAX 模型：加入宏观因子 DXY, TNX, VIX, RealRate
+arimax_preds = None
+mae_arimax = np.nan
+rmse_arimax = np.nan
+
+if exog_train is not None:
+    try:
+        arimax_model = sm.tsa.SARIMAX(
+            train,
+            order=arima_order,
+            exog=exog_train,
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+        )
+        arimax_res = arimax_model.fit(disp=False)
+        arimax_forecast = arimax_res.get_forecast(
+            steps=len(test), exog=exog_test
+        )
+        arimax_preds = arimax_forecast.predicted_mean
+        diff_arimax = test.values - arimax_preds.values
+        mae_arimax = np.mean(np.abs(diff_arimax))
+        rmse_arimax = np.sqrt(np.mean(diff_arimax ** 2))
+        print(f"ARIMAX{arima_order} MAE={mae_arimax:.6f}, RMSE={rmse_arimax:.6f}")
+    except Exception as e:
+        print("ARIMAX 拟合失败:", e)
 
 # 如可用，计算 Prophet 的滚动一步预测
 prophet_preds = None
@@ -211,6 +304,8 @@ plt.figure()
 plt.plot(test.index, test.values, label='Actual')
 plt.plot(test.index, rw_preds.values, label='RW (benchmark)')
 plt.plot(test.index, arima_preds.values, label=f'ARIMA{arima_order}')
+if arimax_preds is not None:
+    plt.plot(test.index, arimax_preds.values, label=f'ARIMAX{arima_order} (macro)')
 if prophet_preds is not None:
     plt.plot(test.index, prophet_preds.values, label='Prophet')
 plt.title(f'{ticker} one-step forecasts (test set)')
@@ -226,6 +321,8 @@ plt.show()
 plt.figure()
 plt.plot(test.index, test.values, label='Actual')
 plt.plot(test.index, arima_preds.values, label=f'ARIMA{arima_order}')
+if arimax_preds is not None:
+    plt.plot(test.index, arimax_preds.values, label=f'ARIMAX{arima_order} (macro)')
 plt.title(f'{ticker} ARIMA vs Actual (test set)')
 plt.xlabel('Date')
 plt.ylabel('Price')
@@ -259,5 +356,10 @@ if prophet_preds is not None:
     metrics.update({
         'Prophet_MAE': float(mae_pr),
         'Prophet_RMSE': float(rmse_pr)
+    })
+if arimax_preds is not None and not np.isnan(mae_arimax):
+    metrics.update({
+        'ARIMAX_MAE': float(mae_arimax),
+        'ARIMAX_RMSE': float(rmse_arimax),
     })
 print(metrics)
