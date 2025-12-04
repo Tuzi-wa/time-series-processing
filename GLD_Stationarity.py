@@ -2,16 +2,18 @@
 GLD_Stationarity.py
 
 Standalone script to analyse the stationarity of GLD (gold ETF) prices.
+
 This script:
 - downloads daily GLD prices from Yahoo Finance
 - creates a train / test split (80% / 20%)
-- applies log transform and first difference on the TRAIN set
+- applies log transform and first difference
 - runs ADF tests on original, log, and differenced log series
 - plots:
-    1) Original vs log price (full sample)
-    2) Differenced log price (train only)
-    3) ACF of differenced log price (train only)
-    4) PACF of differenced log price (train only)
+    1) Original price
+    2) Log price
+    3) Differenced log price (full sample, improved visualization)
+    4) ACF of differenced log price (TRAIN only)
+    5) PACF of differenced log price (TRAIN only)
 """
 
 import numpy as np
@@ -66,7 +68,10 @@ def main():
     # Log transform on full series (for visualization)
     ts_log = np.log(ts)
 
-    # Log transform and difference on TRAIN ONLY (for ARIMA component)
+    # First difference of log price (full sample)
+    ts_log_diff = ts_log.diff().dropna()
+
+    # Log transform and difference on TRAIN ONLY (for ACF/PACF / ARIMA component)
     ts_log_train = np.log(train)
     ts_log_diff_train = ts_log_train.diff().dropna()
 
@@ -79,37 +84,73 @@ def main():
     # 4. Plots
     # =========================
 
-    # Figure 1: Original vs Log price
+    # Figure 1: Original price (level)
     plt.figure(figsize=(10, 5))
     plt.plot(ts.index, ts.values, label="Original Price")
-    plt.plot(ts_log.index, ts_log.values, label="Log Price")
-    plt.title("GLD Original Price vs Log Price")
+    plt.title("GLD Original Price")
     plt.xlabel("Date")
-    plt.ylabel("Value")
+    plt.ylabel("Price (USD)")
     plt.legend()
     plt.tight_layout()
     plt.show()
 
-    # Figure 2: Differenced Log Price (TRAIN only)
+    # Figure 2: Log price (separate)
     plt.figure(figsize=(10, 5))
-    plt.plot(ts_log_diff_train.index, ts_log_diff_train.values, label="Δ Log Price (TRAIN)")
-    plt.title("Differenced Log Price (TRAIN, stationary target for ARIMA)")
+    plt.plot(ts_log.index, ts_log.values, label="Log Price", color="tab:orange")
+    plt.title("GLD Log Price")
     plt.xlabel("Date")
-    plt.ylabel("Differenced Value")
+    plt.ylabel("Log Price")
     plt.legend()
     plt.tight_layout()
     plt.show()
 
-    # Figure 3: ACF of differenced log price (TRAIN)
+    # Figure 3: Differenced Log Price (stationary target) - Improved visualization
+    plt.figure(figsize=(12, 6))
+
+    # Prepare data as 1D arrays
+    x_vals = ts_log_diff.index
+    y_vals = ts_log_diff.to_numpy().ravel()  # ensure 1D
+
+    # Main line: use full differenced log price series
+    plt.plot(
+        x_vals,
+        y_vals,
+        color="steelblue",
+        linewidth=0.8,
+        label="Δ Log Price"
+    )
+
+    # Fill volatility visually
+    plt.fill_between(
+        x_vals,
+        y_vals,
+        np.zeros_like(y_vals),
+        color="skyblue",
+        alpha=0.25
+    )
+
+    # Zero reference line
+    plt.axhline(0, color="black", linewidth=1, linestyle='--', alpha=0.6)
+
+    plt.title("Differenced Log Price (stationary target)")
+    plt.xlabel("Date")
+    plt.ylabel("Differenced Log Price")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+    # Figure 4: ACF of differenced log price (TRAIN)
     plt.figure(figsize=(12, 4))
     plot_acf(ts_log_diff_train, lags=40, ax=plt.gca())
+    plt.ylim(-0.05, 0.05)
     plt.title("ACF (Differenced Log Price - TRAIN)")
     plt.tight_layout()
     plt.show()
 
-    # Figure 4: PACF of differenced log price (TRAIN)
+    # Figure 5: PACF of differenced log price (TRAIN)
     plt.figure(figsize=(12, 4))
     plot_pacf(ts_log_diff_train, lags=40, method="ywm", ax=plt.gca())
+    plt.ylim(-0.05, 0.05)
     plt.title("PACF (Differenced Log Price - TRAIN)")
     plt.tight_layout()
     plt.show()
