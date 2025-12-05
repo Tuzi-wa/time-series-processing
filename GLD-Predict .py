@@ -120,33 +120,32 @@ print(f"使用数据源：{src}，ticker：{ticker}，样本数：{len(df)}")
 
 # 选择价格列：优先 Adj Close，没有就用 Close
 price_col = "Adj Close" if "Adj Close" in df.columns else "Close"
-ts = df[price_col].dropna()
+price_series = df[price_col].dropna()  # 原始价格
+log_series = np.log(price_series)      # 对价格取对数（用于 ARIMA / ARIMAX）
 
 # =========================
-# Figure 1: Full sample time series (Data section)
+# Figure 1: Full sample time series (Data section) - 原始价格
 # =========================
 plt.figure()
-plt.plot(ts.index, ts.values, label=f'{ticker} price')
+plt.plot(price_series.index, price_series.values, label=f'{ticker} price')
 plt.title(f'{ticker} full sample price series')
 plt.xlabel('Date')
-plt.ylabel('Price')
+plt.ylabel('Price (USD)')
 plt.legend()
 plt.tight_layout()
 plt.show()
 
-
-# ⚠️ 改进: Prophet 可以处理非连续时间序列，不需要强制转换为日频率并填充。
-# 移除这一步可以避免对非交易日价格进行不必要的假设。
-# ts = ts.asfreq("D").ffill() 
-
 # 基础检查与切分
-n = len(ts)
+n = len(price_series)
 if n < 2:
     raise ValueError(f"{ticker} 可用数据过少：{n} 行。")
 
 split = int(n * 0.8)
-train, test = ts.iloc[:split], ts.iloc[split:]
-if test.empty:
+
+# 价格空间和 log 空间都做 80/20 切分
+price_train, price_test = price_series.iloc[:split], price_series.iloc[split:]
+log_train, log_test = log_series.iloc[:split], log_series.iloc[split:]
+if price_test.empty:
     raise ValueError("测试集为空，请调整时间范围或切分比例。")
 
 # =========================
@@ -160,7 +159,7 @@ try:
         ["DX-Y.NYB", "DXY"], start=start_date, end=None, interval=interval
     )
     dxy_price_col = "Adj Close" if "Adj Close" in dxy_df.columns else "Close"
-    macro_series["DXY"] = dxy_df[dxy_price_col].reindex(ts.index).ffill()
+    macro_series["DXY"] = dxy_df[dxy_price_col].reindex(price_series.index).ffill()
 except Exception as e:
     print("DXY 下载失败:", e)
 
@@ -170,7 +169,7 @@ try:
         ["^TNX"], start=start_date, end=None, interval=interval
     )
     tnx_price_col = "Adj Close" if "Adj Close" in tnx_df.columns else "Close"
-    macro_series["TNX"] = tnx_df[tnx_price_col].reindex(ts.index).ffill()
+    macro_series["TNX"] = tnx_df[tnx_price_col].reindex(price_series.index).ffill()
 except Exception as e:
     print("TNX 下载失败:", e)
 
@@ -180,7 +179,7 @@ try:
         ["^VIX"], start=start_date, end=None, interval=interval
     )
     vix_price_col = "Adj Close" if "Adj Close" in vix_df.columns else "Close"
-    macro_series["VIX"] = vix_df[vix_price_col].reindex(ts.index).ffill()
+    macro_series["VIX"] = vix_df[vix_price_col].reindex(price_series.index).ffill()
 except Exception as e:
     print("VIX 下载失败:", e)
 
@@ -190,7 +189,7 @@ try:
         ["^GSPC"], start=start_date, end=None, interval=interval
     )
     gspc_price_col = "Adj Close" if "Adj Close" in gspc_df.columns else "Close"
-    macro_series["GSPC"] = gspc_df[gspc_price_col].reindex(ts.index).ffill()
+    macro_series["GSPC"] = gspc_df[gspc_price_col].reindex(price_series.index).ffill()
 except Exception as e:
     print("GSPC 下载失败:", e)
 
@@ -198,7 +197,7 @@ except Exception as e:
 if HAS_FRED:
     try:
         rr = web.DataReader("DFII10", "fred", start_date)
-        rr_series = rr.iloc[:, 0].reindex(ts.index).ffill()
+        rr_series = rr.iloc[:, 0].reindex(price_series.index).ffill()
         macro_series["RealRate"] = rr_series
     except Exception as e:
         print("RealRate (DFII10) 下载失败:", e)
@@ -212,9 +211,13 @@ for name in ["DXY", "TNX", "VIX", "RealRate", "GSPC"]:
         exog_list.append(s)
 
 if exog_list:
+    # 原始宏观因子矩阵（水平数据）
     exog = pd.concat(exog_list, axis=1)
-    exog_train = exog.iloc[:split]
-    exog_test = exog.iloc[split:]
+    # 对宏观变量做一阶差分，并用 0 填充首行，保持与价格序列长度一致
+    exog_diff = exog.diff().fillna(0.0)
+    # 使用差分后的宏观变量作为 ARIMAX 的外生输入（与 ts 的 80/20 切分对齐）
+    exog_train = exog_diff.iloc[:split]
+    exog_test = exog_diff.iloc[split:]
 else:
     exog = None
     exog_train = None
@@ -222,94 +225,125 @@ else:
 
 
 # =========================
-# Figure 1b: Macro Drivers Overview (Data section)
-#   1b-1: Core macro drivers (DXY, TNX, GSPC, RealRate)
-#   1b-2: VIX alone (high-volatility factor)
+# Figure 1b: Differenced Macro Drivers (Data section)
+#   图 1b-1: 仅 RealRate 与 DXY（差分后，标准化）
+#   图 1b-2: RealRate, DXY, VIX, TNX, GSPC 全部（差分后，标准化）
 # =========================
 if macro_series:
-    # 合并所有宏观因子并按列标准化
+    # 将宏观因子合并为一个 DataFrame（水平数据）
     macro_df = pd.concat(macro_series.values(), axis=1)
     macro_df.columns = list(macro_series.keys())
-    # 使用按列标准化，避免 pandas 在 std 上的递归问题
-    macro_norm = macro_df.apply(lambda s: (s - s.mean()) / s.std())
+    # 对宏观因子做一阶差分，并去掉首行 NaN
+    macro_diff = macro_df.diff().dropna()
+    # 按列标准化
+    macro_diff_norm = macro_diff.apply(lambda s: (s - s.mean()) / s.std())
 
-    # ---- Figure 1b-1: 核心宏观因子（波动较平稳）----
-    core_cols = [c for c in ["DXY", "TNX", "GSPC", "RealRate"] if c in macro_norm.columns]
-    if core_cols:
+    # ---- 图 1b-1: 仅 RealRate 与 DXY ----
+    cols_rd = [c for c in ["RealRate", "DXY"] if c in macro_diff_norm.columns]
+    colormap = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+    vlines = [
+        pd.Timestamp('2008-09-15'),
+        pd.Timestamp('2013-05-22'),
+        pd.Timestamp('2020-03-16')
+    ]
+    if cols_rd:
+        plt.figure(figsize=(10, 5))
+        for i, col in enumerate(cols_rd):
+            plt.plot(macro_diff_norm.index, macro_diff_norm[col], label=col, color=colormap[i % len(colormap)])
+        # Removed vlines loop
+        plt.title('Differenced macro drivers (RealRate & DXY)')
+        plt.xlabel('Date')
+        plt.ylabel('Standardized value (z-score)')
+        plt.legend(title="Drivers")
+        plt.tight_layout()
+        plt.show()
+
+    # ---- 图 1b-2: RealRate, DXY, VIX, TNX, GSPC 全部 ----
+    cols_all = [c for c in ["RealRate", "DXY", "VIX", "TNX", "GSPC"] if c in macro_diff_norm.columns]
+    if cols_all:
         plt.figure(figsize=(10, 6))
-        for col in core_cols:
-            plt.plot(macro_norm.index, macro_norm[col], label=col)
-        plt.title('Macro Drivers (Core factors, standardized)')
+        for i, col in enumerate(cols_all):
+            plt.plot(macro_diff_norm.index, macro_diff_norm[col], label=col, color=colormap[i % len(colormap)])
+        # Removed vlines loop
+        plt.title('Differenced macro drivers (All macro drivers)')
         plt.xlabel('Date')
         plt.ylabel('Standardized value (z-score)')
-        plt.legend()
+        plt.legend(title="Drivers")
         plt.tight_layout()
         plt.show()
 
-    # ---- Figure 1b-2: 高波动因子 VIX 单独展示 ----
-    if "VIX" in macro_norm.columns:
-        plt.figure(figsize=(10, 4))
-        plt.plot(macro_norm.index, macro_norm["VIX"], label="VIX")
-        plt.title('VIX (standardized)')
-        plt.xlabel('Date')
-        plt.ylabel('Standardized value (z-score)')
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
+# 随机游走基准（价格空间）：P̂_t = P_{t-1}
+anchor = price_train.iloc[[-1]]
+series_for_pred = pd.concat([anchor, price_test])
+rw_preds = series_for_pred.shift(1).loc[price_test.index]
 
-# 随机游走基准：y_hat_t = y_{t-1}
-anchor = train.iloc[[-1]]
-series_for_pred = pd.concat([anchor, test])
-rw_preds = series_for_pred.shift(1).loc[test.index]
-
-# 评估
-mae = (test - rw_preds).abs().mean()
-rmse = np.sqrt(((test - rw_preds) ** 2).mean())
+# 评估（价格空间）
+mae = (price_test - rw_preds).abs().mean()
+rmse = np.sqrt(((price_test - rw_preds) ** 2).mean())
 
 # ⚠️ 修复: 将 Series 转换为浮点数再格式化。
 print(f"RW baseline MAE={mae.item():.6f}, RMSE={rmse.item():.6f}")
 
 # ARIMA 模型（作为统计型备选模型）
 arima_order = (1, 1, 1)  # 可以在报告中说明通过 AIC/BIC 或试验选择
-hist_arima = train.copy()
-arima_preds_list = []
+# 在 log 空间估计 ARIMA，在价格空间评估
+hist_arima = log_train.copy()
+arima_log_preds_list = []
 
-for t in test.index:
-    # 每一步用当前可用样本重新估计 ARIMA，并做一步预测
+for t in log_test.index:
+    # 每一步用当前可用样本重新估计 ARIMA，并做一步预测（log 空间）
     arima_model = sm.tsa.ARIMA(hist_arima, order=arima_order)
     arima_res = arima_model.fit()
-    forecast = arima_res.forecast(steps=1).iloc[0]
-    arima_preds_list.append(float(forecast))
-    # 将真实值加入样本，递归前进
-    hist_arima.loc[t] = test.loc[t]
+    forecast_log = arima_res.forecast(steps=1).iloc[0]
+    arima_log_preds_list.append(float(forecast_log))
+    # 将真实的 log 价格加入样本，递归前进
+    hist_arima.loc[t] = log_test.loc[t]
 
-arima_preds = pd.Series(arima_preds_list, index=test.index)
+arima_log_preds = pd.Series(arima_log_preds_list, index=log_test.index)
+arima_price_preds = np.exp(arima_log_preds)
 
-diff_arima = test.values - arima_preds.values
+diff_arima = price_test.values - arima_price_preds.values
 mae_arima = np.mean(np.abs(diff_arima))
 rmse_arima = np.sqrt(np.mean(diff_arima ** 2))
 print(f"ARIMA{arima_order} MAE={mae_arima.item():.6f}, RMSE={rmse_arima.item():.6f}")
 
 # ARIMAX 模型：加入宏观因子 DXY, TNX, VIX, RealRate
 arimax_preds = None
+arimax_price_preds = None
 mae_arimax = np.nan
 rmse_arimax = np.nan
 
 if exog_train is not None:
     try:
-        arimax_model = sm.tsa.SARIMAX(
-            train,
-            order=arima_order,
-            exog=exog_train,
-            enforce_stationarity=False,
-            enforce_invertibility=False,
-        )
-        arimax_res = arimax_model.fit(disp=False)
-        arimax_forecast = arimax_res.get_forecast(
-            steps=len(test), exog=exog_test
-        )
-        arimax_preds = arimax_forecast.predicted_mean
-        diff_arimax = test.values - arimax_preds.values
+        # 使用与 ARIMA 相同的“滚动一步预测”方案，但加入宏观外生变量
+        hist_y = log_train.copy()
+        hist_exog = exog_train.copy()
+        arimax_log_preds_list = []
+
+        for t in log_test.index:
+            # 当前这一步的外生变量（1 行 DataFrame）
+            exog_fore = exog_test.loc[[t]]
+
+            arimax_model = sm.tsa.SARIMAX(
+                hist_y,
+                order=arima_order,
+                exog=hist_exog,
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+            )
+            arimax_res = arimax_model.fit(disp=False)
+            forecast_log = arimax_res.forecast(steps=1, exog=exog_fore).iloc[0]
+            arimax_log_preds_list.append(float(forecast_log))
+
+            # 将真实的 log 价格和对应的外生变量加入样本，递归向前滚动
+            hist_y.loc[t] = log_test.loc[t]
+            hist_exog.loc[t] = exog_test.loc[t]
+
+        arimax_log_preds = pd.Series(arimax_log_preds_list, index=log_test.index)
+        arimax_price_preds = np.exp(arimax_log_preds)
+        arimax_preds = arimax_price_preds  # 供后面指标统计使用
+
+        diff_arimax = price_test.values - arimax_price_preds.values
         mae_arimax = np.mean(np.abs(diff_arimax))
         rmse_arimax = np.sqrt(np.mean(diff_arimax ** 2))
         print(f"ARIMAX{arima_order} MAE={mae_arimax:.6f}, RMSE={rmse_arimax:.6f}")
@@ -325,21 +359,21 @@ if HAS_PROPHET:
         dfp.columns = ["ds", "y"]
         return dfp
     
-    hist = train.copy()
+    hist = price_train.copy()
     prophet_preds_list = []
-    for t in test.index:
+    for t in price_test.index:
         df_p = to_prophet_df(hist)
-        # ⚠️ 修复: 对于滚动预测，需要每次循环都实例化一个新的模型。
+        # ⚠️ 每次循环都实例化一个新的 Prophet 模型
         model = Prophet(seasonality_mode='multiplicative')
-        model.fit(df_p) 
+        model.fit(df_p)
         future = pd.DataFrame({"ds": [t]})
         yhat = model.predict(future)["yhat"].iloc[0]
         prophet_preds_list.append(yhat)
-        # 加入真实值，滚动前进
-        hist.loc[t] = test.loc[t]
+        # 加入真实价格，滚动前进
+        hist.loc[t] = price_test.loc[t]
 
-    prophet_preds = pd.Series(prophet_preds_list, index=test.index)
-    diff_pr = test.values - prophet_preds.values
+    prophet_preds = pd.Series(prophet_preds_list, index=price_test.index)
+    diff_pr = price_test.values - prophet_preds.values
     mae_pr = np.mean(np.abs(diff_pr))
     rmse_pr = np.sqrt(np.mean(diff_pr ** 2))
     # ⚠️ 修复: 将 Series 转换为浮点数再格式化。
@@ -349,14 +383,32 @@ if HAS_PROPHET:
 # Figure 2: Combined forecasts vs Actual (Results section)
 # =========================
 plt.figure()
-plt.plot(test.index, test.values, label='Actual')
-plt.plot(test.index, rw_preds.values, label='RW (benchmark)')
-plt.plot(test.index, arima_preds.values, label=f'ARIMA{arima_order}')
-if arimax_preds is not None:
-    plt.plot(test.index, arimax_preds.values, label=f'ARIMAX{arima_order} (macro)')
+plt.plot(price_test.index, price_test.values, label='Actual')
+plt.plot(price_test.index, rw_preds.values, label='RW (benchmark)')
+plt.plot(price_test.index, arima_price_preds.values, label=f'ARIMA{arima_order}')
+if exog_train is not None and not np.isnan(mae_arimax):
+    plt.plot(price_test.index, arimax_price_preds.values, label=f'ARIMAX{arima_order} (macro)')
 if prophet_preds is not None:
-    plt.plot(test.index, prophet_preds.values, label='Prophet')
+    plt.plot(price_test.index, prophet_preds.values, label='Prophet')
 plt.title(f'{ticker} one-step forecasts (test set)')
+plt.xlabel('Date')
+plt.ylabel('Price')
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# =========================
+# Figure 2b: Model comparison without RW (Results section)
+#   Focus on ARIMA vs ARIMAX vs Prophet
+# =========================
+plt.figure()
+plt.plot(price_test.index, price_test.values, label='Actual')
+plt.plot(price_test.index, arima_price_preds.values, label=f'ARIMA{arima_order}')
+if exog_train is not None and not np.isnan(mae_arimax):
+    plt.plot(price_test.index, arimax_price_preds.values, label=f'ARIMAX{arima_order} (macro)')
+if prophet_preds is not None:
+    plt.plot(price_test.index, prophet_preds.values, label='Prophet')
+plt.title(f'{ticker} price forecast comparison: univariate vs multivariate models')
 plt.xlabel('Date')
 plt.ylabel('Price')
 plt.legend()
@@ -367,10 +419,10 @@ plt.show()
 # Figure 3: ARIMA vs Actual (Appendix)
 # =========================
 plt.figure()
-plt.plot(test.index, test.values, label='Actual')
-plt.plot(test.index, arima_preds.values, label=f'ARIMA{arima_order}')
-if arimax_preds is not None:
-    plt.plot(test.index, arimax_preds.values, label=f'ARIMAX{arima_order} (macro)')
+plt.plot(price_test.index, price_test.values, label='Actual')
+plt.plot(price_test.index, arima_price_preds.values, label=f'ARIMA{arima_order}')
+if exog_train is not None and not np.isnan(mae_arimax):
+    plt.plot(price_test.index, arimax_price_preds.values, label=f'ARIMAX{arima_order} (macro)')
 plt.title(f'{ticker} ARIMA vs Actual (test set)')
 plt.xlabel('Date')
 plt.ylabel('Price')
@@ -384,8 +436,8 @@ if prophet_preds is not None:
     # Figure 4: Prophet vs Actual (Appendix)
     # =========================
     plt.figure()
-    plt.plot(test.index, test.values, label='Actual')
-    plt.plot(test.index, prophet_preds.values, label='Prophet')
+    plt.plot(price_test.index, price_test.values, label='Actual')
+    plt.plot(price_test.index, prophet_preds.values, label='Prophet')
     plt.title(f'{ticker} Prophet vs Actual (test set)')
     plt.xlabel('Date')
     plt.ylabel('Price')
@@ -393,21 +445,80 @@ if prophet_preds is not None:
     plt.tight_layout()
     plt.show()
 
-# 汇总指标输出
-metrics = {
-    'RW_MAE': float(mae),
-    'RW_RMSE': float(rmse),
-    'ARIMA_MAE': float(mae_arima),
-    'ARIMA_RMSE': float(rmse_arima),
-}
+# =========================
+# 汇总指标输出：把所有模型的 MAE / RMSE 放到一个表里
+# =========================
+rows = []
+
+# 随机游走
+rows.append((
+    "RW",
+    float(mae.item()),
+    float(rmse.item())
+))
+
+# ARIMA
+rows.append((
+    "ARIMA",
+    float(mae_arima),
+    float(rmse_arima)
+))
+
+# ARIMAX（如果成功估计）
+if not np.isnan(mae_arimax):
+    rows.append((
+        "ARIMAX",
+        float(mae_arimax),
+        float(rmse_arimax)
+    ))
+
+# Prophet（如果存在）
 if prophet_preds is not None:
-    metrics.update({
-        'Prophet_MAE': float(mae_pr),
-        'Prophet_RMSE': float(rmse_pr)
-    })
-if arimax_preds is not None and not np.isnan(mae_arimax):
-    metrics.update({
-        'ARIMAX_MAE': float(mae_arimax),
-        'ARIMAX_RMSE': float(rmse_arimax),
-    })
-print(metrics)
+    rows.append((
+        "Prophet",
+        float(mae_pr),
+        float(rmse_pr)
+    ))
+
+metrics_df = pd.DataFrame(rows, columns=["Model", "MAE", "RMSE"]).set_index("Model")
+
+print("\n===== Forecast Error Summary (MAE / RMSE) =====")
+print(metrics_df)
+print("==============================================\n")
+
+# =========================
+# Figure 5: Error Comparison (RW vs ARIMA)
+# =========================
+if {"RW", "ARIMA"}.issubset(metrics_df.index):
+    subset = metrics_df.loc[["RW", "ARIMA"]]
+
+    plt.figure()
+    plt.bar(subset.index, subset["MAE"])
+    plt.title("MAE Comparison: RW vs ARIMA")
+    plt.ylabel("MAE")
+    plt.tight_layout()
+    plt.show()
+
+    plt.figure()
+    plt.bar(subset.index, subset["RMSE"])
+    plt.title("RMSE Comparison: RW vs ARIMA")
+    plt.ylabel("RMSE")
+    plt.tight_layout()
+    plt.show()
+
+# =========================
+# Figure 6: Error Comparison (all available models)
+# =========================
+plt.figure()
+plt.bar(metrics_df.index, metrics_df["MAE"])
+plt.title("MAE Comparison across models")
+plt.ylabel("MAE")
+plt.tight_layout()
+plt.show()
+
+plt.figure()
+plt.bar(metrics_df.index, metrics_df["RMSE"])
+plt.title("RMSE Comparison across models")
+plt.ylabel("RMSE")
+plt.tight_layout()
+plt.show()
