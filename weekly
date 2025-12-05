@@ -1,0 +1,323 @@
+import os
+import time
+import random
+import pickle
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_squared_error
+
+try:
+    from pandas_datareader import data as web
+    HAS_FRED = True
+except Exception:
+    HAS_FRED = False
+    print("pandas_datareader/FRED 不可用，RealRate 将被跳过。")
+
+print("ENV VERSIONS -> numpy:", np.version.version) 
+
+# ----------------------------------------------------
+# 辅助函数和数据下载
+# ----------------------------------------------------
+
+# yfinance 下载参数
+YF_KW = dict(progress=False, threads=False, auto_adjust=True, actions=False, repair=True)
+
+def try_yf(ticker, start=None, end=None, interval="1d",
+           max_retries=6, base_sleep=1.0, cache_dir="cache"):
+    """yfinance 下载，带指数回退+随机抖动，并写入本地缓存。"""
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_fp = os.path.join(cache_dir, f"yf_{ticker}_{interval}_{start}_{end}.pkl")
+
+    if os.path.exists(cache_fp):
+        try:
+            with open(cache_fp, "rb") as f:
+                df = pickle.load(f)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df, "yf-cache"
+        except Exception:
+            pass
+
+    last_err = None
+    for i in range(max_retries):
+        try:
+            df = yf.download(ticker, start=start, end=end, interval=interval, **YF_KW)
+            if not df.empty:
+                df.dropna(how="all", inplace=True)
+                if not df.empty:
+                    with open(cache_fp, "wb") as f:
+                        pickle.dump(df, f)
+                    return df, "yf"
+        except Exception as e:
+            last_err = e
+
+        try:
+            tk = yf.Ticker(ticker)
+            df = tk.history(start=start, end=end, interval=interval, auto_adjust=True, actions=False, repair=true)
+            if isinstance(df.columns, pd.MultiIndex):
+                df = df.droplevel(0, axis=1)
+            df.dropna(how="all", inplace=True)
+            if not df.empty:
+                with open(cache_fp, "wb") as f:
+                    pickle.dump(df, f)
+                return df, "yf-history"
+        except Exception as e2:
+            last_err = e2
+
+        sleep_s = (base_sleep * (2 ** i)) + random.uniform(0, 0.5)
+        time.sleep(min(sleep_s, 20))
+
+    raise last_err if last_err else RuntimeError("yfinance 下载失败且无具体异常")
+
+
+def download_with_fallback(candidates, start="2000-01-01", end=None, interval="1d"):
+    """仅使用 yfinance（多次重试+本地缓存）。"""
+    last_err = None
+    for t in candidates:
+        try:
+            df, src = try_yf(t, start=start, end=end, interval=interval)
+            return t, df, src
+        except Exception as e:
+            print(f"yfinance: {t} 失败：{e}")
+            last_err = e
+    raise RuntimeError(f"所有数据源均失败，最后错误：{last_err}")
+
+
+# 入口参数与下载
+candidates = ["GLD"]
+start_date = "2000-01-01"
+interval = "1d"
+
+ticker, df, src = download_with_fallback(candidates, start=start_date, end=None, interval=interval)
+print(f"使用数据源：{src}，ticker：{ticker}，样本数：{len(df)}")
+
+# 选择价格列
+price_col = "Adj Close" if "Adj Close" in df.columns else "Close"
+price_series_daily = df[price_col].dropna()
+
+# 🌟 降采样 1: GLD 价格降采样到周度频率 (Weekly Resampling)
+price_series = price_series_daily.resample('W').last().dropna()
+log_series = np.log(price_series)
+
+print(f"降采样后，周度样本数：{len(price_series)}")
+
+# 基础检查与切分
+n = len(price_series)
+if n < 2:
+    raise ValueError(f"{ticker} 可用数据过少：{n} 行。")
+
+split = int(n * 0.8)
+
+# 价格空间和 log 空间都做 80/20 切分
+price_train, price_test = price_series.iloc[:split], price_series.iloc[split:]
+log_train, log_test = log_series.iloc[:split], log_series.iloc[split:]
+if price_test.empty:
+    raise ValueError("测试集为空，请调整时间范围或切分比例。")
+
+# =========================
+# 宏观因子下载与处理 (只下载和处理所需的显著因子)
+# =========================
+macro_series = {}
+
+# 1. Dollar index (DXY) - 下载备用
+try:
+    _, dxy_df, _ = download_with_fallback(["DX-Y.NYB", "DXY"], start=start_date, end=None, interval=interval)
+    dxy_price_col = "Adj Close" if "Adj Close" in dxy_df.columns else "Close"
+    dxy_series_daily = dxy_df[dxy_price_col].reindex(price_series_daily.index).ffill()
+    dxy_series = dxy_series_daily.resample('W').last().reindex(price_series.index).ffill()
+    macro_series["DXY"] = dxy_series
+except Exception:
+    pass
+
+# 2. 10Y nominal yield (TNX) - 显著因子
+try:
+    _, tnx_df, _ = download_with_fallback(["^TNX"], start=start_date, end=None, interval=interval)
+    tnx_price_col = "Adj Close" if "Adj Close" in tnx_df.columns else "Close"
+    tnx_series_daily = tnx_df[tnx_price_col].reindex(price_series_daily.index).ffill()
+    tnx_series = tnx_series_daily.resample('W').last().reindex(price_series.index).ffill()
+    macro_series["TNX"] = tnx_series
+except Exception as e:
+    print("TNX 下载失败:", e)
+
+# 3. S&P 500 index (^GSPC) - 显著因子
+try:
+    _, gspc_df, _ = download_with_fallback(["^GSPC"], start=start_date, end=None, interval=interval)
+    gspc_price_col = "Adj Close" if "Adj Close" in gspc_df.columns else "Close"
+    gspc_series_daily = gspc_df[gspc_price_col].reindex(price_series_daily.index).ffill()
+    gspc_series = gspc_series_daily.resample('W').last().reindex(price_series.index).ffill()
+    macro_series["GSPC"] = gspc_series
+except Exception as e:
+    print("GSPC 下载失败:", e)
+    
+# 4. Real rate: 10-year TIPS real yield (DFII10 from FRED) - 下载备用
+if HAS_FRED:
+    try:
+        rr = web.DataReader("DFII10", "fred", start_date)
+        rr_series_daily = rr.iloc[:, 0].reindex(price_series_daily.index).ffill()
+        rr_series = rr_series_daily.resample('W').last().reindex(price_series.index).ffill()
+        macro_series["RealRate"] = rr_series
+    except Exception as e:
+        print("RealRate (DFII10) 下载失败:", e)
+
+
+# 组装外生变量矩阵 exog
+exog_list = []
+# 🔑 最终修正：只保留 TNX 和 GSPC（统计上显著的因子）
+for name in ["TNX", "GSPC"]:
+    if name in macro_series:
+        s = macro_series[name].copy()
+        s.name = name
+        exog_list.append(s)
+
+if not exog_list:
+    exog_train = None
+    exog_test = None
+    print("没有可用的宏观因子，ARIMAX将不会运行。")
+else:
+    exog = pd.concat(exog_list, axis=1)
+
+    # 差分和滞后处理: 使用平稳的 ΔX_{t-1}
+    exog_diff = exog.diff().fillna(0.0)
+    exog_lagged = pd.DataFrame(index=exog_diff.index)
+    
+    # 步骤 2: 构建滞后特征矩阵（使用滞后 1 期 $\Delta X_{t-1}$）
+    for col in exog_diff.columns:
+        exog_lagged[f"L1_{col}"] = exog_diff[col].shift(1).fillna(0.0)
+        
+    exog_train = exog_lagged.iloc[:split]
+    exog_test = exog_lagged.iloc[split:]
+
+    print(f"ARIMAX使用的外生变量 (滞后差分): {list(exog_train.columns)}")
+
+
+# ----------------------------------------------------
+# 模型预测与评估 (单次拟合模式 - 核心稳定结构)
+# ----------------------------------------------------
+
+# 随机游走基准
+anchor = price_train.iloc[[-1]]
+series_for_pred = pd.concat([anchor, price_test])
+rw_preds = series_for_pred.shift(1).loc[price_test.index]
+
+mae_rw = (price_test - rw_preds).abs().mean()
+rmse_rw = np.sqrt(((price_test - rw_preds) ** 2).mean())
+
+
+# 核心模型结构：ARIMA(0, 1, 0)
+arima_order = (0, 1, 0)
+mae_arima = np.nan
+rmse_arima = np.nan
+
+# --- A. ARIMA(0, 1, 0) 单次拟合 ---
+try:
+    arima_model = sm.tsa.ARIMA(log_train, order=arima_order)
+    arima_res = arima_model.fit(disp=False) 
+    arima_log_preds = arima_res.predict(start=log_test.index[0], end=log_test.index[-1])
+    
+    arima_price_preds = np.exp(arima_log_preds)
+    
+    mae_arima = np.mean(np.abs(price_test.values - arima_price_preds.values))
+    rmse_arima = np.sqrt(np.mean((price_test.values - arima_price_preds.values) ** 2))
+    
+    # 打印模型结构摘要
+    print("\n[ARIMA(0, 1, 0) Model Summary]")
+    print(arima_res.summary())
+
+except Exception as e:
+    print(f"ARIMA 单次拟合失败: {e}")
+
+
+# --- B. ARIMAX (TNX, GSPC) 单次拟合 ---
+mae_arimax = np.nan
+rmse_arimax = np.nan
+arimax_res_summary = ""
+arimax_preds_label = "ARIMAX(TNX, GSPC)"
+
+if exog_train is not None:
+    try:
+        arimax_model = sm.tsa.SARIMAX(
+            log_train,
+            order=arima_order,
+            exog=exog_train,
+            enforce_stationarity=False,
+            enforce_invertibility=False,
+        )
+        arimax_res = arimax_model.fit(disp=False)
+        
+        arimax_log_preds = arimax_res.predict(
+            start=log_test.index[0], 
+            end=log_test.index[-1],
+            exog=exog_test 
+        )
+        
+        arimax_price_preds = np.exp(arimax_log_preds)
+
+        mae_arimax = np.mean(np.abs(price_test.values - arimax_price_preds.values))
+        rmse_arimax = np.sqrt(np.mean((price_test.values - arimax_price_preds.values) ** 2))
+
+        # 捕获 ARIMAX 模型结构摘要 (最重要！)
+        arimax_res_summary = str(arimax_res.summary())
+        print("\n[ARIMAX(0, 1, 0) Model Summary with TNX & GSPC] - See Full Output")
+
+    except Exception as e:
+        print(f"ARIMAX 单次拟合失败: {e}")
+
+
+# =========================
+# 汇总指标输出：最终表格
+# =========================
+rows = []
+
+rows.append((
+    "RW",
+    float(mae_rw.item()),
+    float(rmse_rw.item())
+))
+
+if not np.isnan(mae_arima):
+    rows.append((
+        "ARIMA(0,1,0)",
+        float(mae_arima),
+        float(rmse_arima)
+    ))
+
+if not np.isnan(mae_arimax):
+    rows.append((
+        arimax_preds_label,
+        float(mae_arimax),
+        float(rmse_arimax)
+    ))
+
+metrics_df = pd.DataFrame(rows, columns=["Model", "MAE", "RMSE"]).set_index("Model")
+
+print("\n===== Forecast Error Summary (MAE / RMSE) =====")
+print(metrics_df)
+print("==============================================\n")
+
+# 打印 ARIMAX 模型的详细摘要
+if arimax_res_summary:
+    print("\n\n===== ARIMAX Model Summary (Full Details) =====")
+    print(arimax_res_summary)
+    print("==============================================\n")
+
+# ----------------------------------------------------
+# 可视化（可选：用于 Appendix）
+# ----------------------------------------------------
+plt.figure(figsize=(12, 6))
+plt.plot(price_test.index, price_test.values, label='Actual', color='blue', linewidth=2)
+plt.plot(price_test.index, rw_preds.values, label='RW (Benchmark)', linestyle='--', color='orange')
+
+if arima_price_preds is not None and not np.isnan(mae_arima):
+    plt.plot(price_test.index, arima_price_preds.values, label='ARIMA(0,1,0)', linestyle=':', color='green')
+
+if arimax_price_preds is not None and not np.isnan(mae_arimax):
+    plt.plot(price_test.index, arimax_price_preds.values, label=arimax_preds_label, linestyle='-', color='red')
+
+plt.title('Weekly Forecast Comparison (One-Time Fit)')
+plt.xlabel('Date')
+plt.ylabel('Price')
+plt.legend()
+plt.tight_layout()
+plt.show()
