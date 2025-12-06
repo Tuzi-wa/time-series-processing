@@ -31,8 +31,8 @@ try:
 except Exception:
     pass
 
-# Forecast horizon in trading days (default: 1 day ahead)
-H = int(os.environ.get("HORIZON", "1"))
+# Forecast horizon in trading days (default: 5 days ahead)
+H = int(os.environ.get("HORIZON", "5"))
 print(f"Forecast horizon H = {H} days")
 
 # 尝试可选依赖 Prophet（没有就跳过）
@@ -215,13 +215,13 @@ for name in ["DXY", "TNX", "VIX", "RealRate", "GSPC"]:
         exog_list.append(s)
 
 if exog_list:
-    # 原始宏观因子矩阵（水平数据）
+    # 原始宏观因子矩阵（水平数据，ARIMAX 使用 level）
     exog = pd.concat(exog_list, axis=1)
-    # 对宏观变量做一阶差分，并用 0 填充首行，保持与价格序列长度一致
-    exog_diff = exog.diff().fillna(0.0)
-    # 使用差分后的宏观变量作为 ARIMAX 的外生输入（与 ts 的 80/20 切分对齐）
-    exog_train = exog_diff.iloc[:split]
-    exog_test = exog_diff.iloc[split:]
+    # 向前填充缺失值，确保与价格序列对齐
+    exog = exog.ffill()
+    # 与价格序列相同的 80/20 切分，用于 ARIMAX 外生变量
+    exog_train = exog.iloc[:split]
+    exog_test = exog.iloc[split:]
 else:
     exog = None
     exog_train = None
@@ -276,125 +276,171 @@ if macro_series:
         plt.tight_layout()
         plt.show()
 
-# 随机游走基准（价格空间）：P̂_t = P_{t-1}
-anchor = price_train.iloc[[-1]]
-series_for_pred = pd.concat([anchor, price_test])
-rw_preds = series_for_pred.shift(1).loc[price_test.index]
+# =========================
+# 构造用于 H-step ahead 评估的测试索引
+# =========================
+test_index = price_test.index
+
+if len(test_index) <= H:
+    raise ValueError(f"测试集长度 {len(test_index)} 过短，无法进行 {H}-step ahead 预测评估。")
+
+# target_index: 每个点都是“预测 H 日之后”的目标日期
+target_index = test_index[H-1:]
+price_test_H = price_test.loc[target_index]
+log_test_H = log_test.loc[target_index]
+
+# =========================
+# 随机游走基准（H-step ahead）：P̂_{t+H} = P_t
+# =========================
+rw_dict = {}
+last_train_price = price_train.iloc[-1]
+
+for i, tgt in enumerate(target_index):
+    # i = 0 时，origin 在训练集末尾；之后 origin 依次为 test_index[i-1]
+    if i == 0:
+        last_obs = last_train_price
+    else:
+        last_obs = price_test.iloc[i-1]
+    rw_dict[tgt] = float(last_obs)
+
+rw_preds = pd.Series(rw_dict, index=target_index)
 
 # 评估（价格空间）
-mae = (price_test - rw_preds).abs().mean()
-rmse = np.sqrt(((price_test - rw_preds) ** 2).mean())
+rw_diff = price_test_H.values - rw_preds.values
+mae = np.mean(np.abs(rw_diff))
+rmse = np.sqrt(np.mean(rw_diff ** 2))
 
-# ⚠️ 修复: 将 Series 转换为浮点数再格式化。
-print(f"RW baseline MAE={mae.item():.6f}, RMSE={rmse.item():.6f}")
+print(f"RW baseline ({H}-step) MAE={mae:.6f}, RMSE={rmse:.6f}")
 
-# ARIMA 模型（作为统计型备选模型）
-arima_order = (1, 1, 1)  # 可以在报告中说明通过 AIC/BIC 或试验选择
-# 在 log 空间估计 ARIMA，在价格空间评估
+# =========================
+# ARIMA 模型（H-step ahead，在 log 空间估计，价格空间评估）
+# =========================
+arima_order = (1, 1, 1)  # 在报告中说明通过 AIC/BIC 或试验选择
+
+arima_dict = {}
 hist_arima = log_train.copy()
-arima_log_preds_list = []
 
-for t in log_test.index:
-    # 每一步用当前可用样本重新估计 ARIMA，并做一步预测（log 空间）
+for i, tgt in enumerate(target_index):
+    # 每个 origin 重新估计一次 ARIMA
     arima_model = sm.tsa.ARIMA(hist_arima, order=arima_order)
     arima_res = arima_model.fit()
-    forecast_log = arima_res.forecast(steps=1).iloc[0]
-    arima_log_preds_list.append(float(forecast_log))
-    # 将真实的 log 价格加入样本，递归前进
-    hist_arima.loc[t] = log_test.loc[t]
 
-arima_log_preds = pd.Series(arima_log_preds_list, index=log_test.index)
-arima_price_preds = np.exp(arima_log_preds)
+    # 预测未来 H 步（log 空间），取路径的最后一个点作为 H-step 预测
+    fcast_log_path = arima_res.forecast(steps=H)
+    forecast_log = fcast_log_path.iloc[-1]
+    arima_dict[tgt] = float(np.exp(forecast_log))
 
-diff_arima = price_test.values - arima_price_preds.values
+    # 用新观测更新样本：新增一个 test_index[i] 的真实 log 价格
+    new_idx = test_index[i]
+    hist_arima.loc[new_idx] = float(log_test.loc[new_idx])
+
+arima_price_preds = pd.Series(arima_dict, index=target_index)
+
+diff_arima = price_test_H.values - arima_price_preds.values
 mae_arima = np.mean(np.abs(diff_arima))
 rmse_arima = np.sqrt(np.mean(diff_arima ** 2))
-print(f"ARIMA{arima_order} MAE={mae_arima.item():.6f}, RMSE={rmse_arima.item():.6f}")
+print(f"ARIMA{arima_order} ({H}-step) MAE={mae_arima:.6f}, RMSE={rmse_arima:.6f}")
 
-# ARIMAX 模型：加入宏观因子 DXY, TNX, VIX, RealRate
-arimax_preds = None
+# =========================
+# ARIMAX 模型：加入宏观因子（H-step ahead）
+# =========================
 arimax_price_preds = None
 mae_arimax = np.nan
 rmse_arimax = np.nan
 
 if exog_train is not None:
     try:
-        # 使用与 ARIMA 相同的“滚动一步预测”方案，但加入宏观外生变量
+        arimax_dict = {}
         hist_y = log_train.copy()
         hist_exog = exog_train.copy()
-        arimax_log_preds_list = []
 
-        for t in log_test.index:
-            # 当前这一步的外生变量（1 行 DataFrame）
-            exog_fore = exog_test.loc[[t]]
+        for i, tgt in enumerate(target_index):
+            # 未来 H 日的外生变量路径（与目标对齐）
+            exog_future = exog_test.iloc[i:i+H]
+            if len(exog_future) < H:
+                break  # 剩余长度不够 H 步，跳出
 
-            arimax_model = sm.tsa.SARIMAX(
+            model = sm.tsa.SARIMAX(
                 hist_y,
                 order=arima_order,
                 exog=hist_exog,
                 enforce_stationarity=False,
                 enforce_invertibility=False,
             )
-            arimax_res = arimax_model.fit(disp=False)
-            forecast_log = arimax_res.forecast(steps=1, exog=exog_fore).iloc[0]
-            arimax_log_preds_list.append(float(forecast_log))
+            res = model.fit(disp=False)
 
-            # 将真实的 log 价格和对应的外生变量加入样本，递归向前滚动
-            hist_y.loc[t] = log_test.loc[t]
-            hist_exog.loc[t] = exog_test.loc[t]
+            fcast_log_path = res.forecast(steps=H, exog=exog_future)
+            forecast_log = fcast_log_path.iloc[-1]
+            arimax_dict[tgt] = float(np.exp(forecast_log))
 
-        arimax_log_preds = pd.Series(arimax_log_preds_list, index=log_test.index)
-        arimax_price_preds = np.exp(arimax_log_preds)
-        arimax_preds = arimax_price_preds  # 供后面指标统计使用
+            # 更新样本：加入一个新的真实观测（log 价格 + 外生变量）
+            new_idx = test_index[i]
+            hist_y.loc[new_idx] = float(log_test.loc[new_idx])
+            hist_exog.loc[new_idx] = exog_test.loc[new_idx]
 
-        diff_arimax = price_test.values - arimax_price_preds.values
-        mae_arimax = np.mean(np.abs(diff_arimax))
-        rmse_arimax = np.sqrt(np.mean(diff_arimax ** 2))
-        print(f"ARIMAX{arima_order} MAE={mae_arimax:.6f}, RMSE={rmse_arimax:.6f}")
+        if arimax_dict:
+            arimax_price_preds = pd.Series(arimax_dict, index=sorted(arimax_dict.keys()))
+            # 确保与目标集合交集
+            common_idx = price_test_H.index.intersection(arimax_price_preds.index)
+            diff_arimax = price_test_H.loc[common_idx].values - arimax_price_preds.loc[common_idx].values
+            mae_arimax = np.mean(np.abs(diff_arimax))
+            rmse_arimax = np.sqrt(np.mean(diff_arimax ** 2))
+            print(f"ARIMAX{arima_order} ({H}-step) MAE={mae_arimax:.6f}, RMSE={rmse_arimax:.6f}")
     except Exception as e:
         print("ARIMAX 拟合失败:", e)
 
-# 如可用，计算 Prophet 的滚动一步预测
+# =========================
+# Prophet 模型：H-step ahead 预测（价格空间）
+# =========================
 prophet_preds = None
+mae_pr = np.nan
+rmse_pr = np.nan
+
 if HAS_PROPHET:
-    # 将训练集转为 Prophet 所需格式
     def to_prophet_df(s: pd.Series):
         dfp = s.reset_index()
         dfp.columns = ["ds", "y"]
         return dfp
-    
+
+    prophet_dict = {}
     hist = price_train.copy()
-    prophet_preds_list = []
-    for t in price_test.index:
+
+    for i, tgt in enumerate(target_index):
         df_p = to_prophet_df(hist)
-        # ⚠️ 每次循环都实例化一个新的 Prophet 模型
         model = Prophet(seasonality_mode='multiplicative')
         model.fit(df_p)
-        future = pd.DataFrame({"ds": [t]})
-        yhat = model.predict(future)["yhat"].iloc[0]
-        prophet_preds_list.append(yhat)
-        # 加入真实价格，滚动前进
-        hist.loc[t] = price_test.loc[t]
 
-    prophet_preds = pd.Series(prophet_preds_list, index=price_test.index)
-    diff_pr = price_test.values - prophet_preds.values
-    mae_pr = np.mean(np.abs(diff_pr))
-    rmse_pr = np.sqrt(np.mean(diff_pr ** 2))
-    # ⚠️ 修复: 将 Series 转换为浮点数再格式化。
-    print(f"Prophet MAE={mae_pr.item():.6f}, RMSE={rmse_pr.item():.6f}")
+        # 向前扩展 H 个“工作日”（freq='B'），取最后一个点作为 H-step 预测
+        future = model.make_future_dataframe(periods=H, freq='B')
+        fcst = model.predict(future)
+        yhat_H = fcst["yhat"].iloc[-1]
+        prophet_dict[tgt] = float(yhat_H)
+
+        # 更新样本：加入一个新的真实价格观测
+        new_idx = test_index[i]
+        hist.loc[new_idx] = float(price_test.loc[new_idx])
+
+    if prophet_dict:
+        prophet_preds = pd.Series(prophet_dict, index=sorted(prophet_dict.keys()))
+        common_idx_p = price_test_H.index.intersection(prophet_preds.index)
+        diff_pr = price_test_H.loc[common_idx_p].values - prophet_preds.loc[common_idx_p].values
+        mae_pr = np.mean(np.abs(diff_pr))
+        rmse_pr = np.sqrt(np.mean(diff_pr ** 2))
+        print(f"Prophet ({H}-step) MAE={mae_pr:.6f}, RMSE={rmse_pr:.6f}")
 
 # =========================
 # Figure 2: Combined forecasts vs Actual (Results section)
+# （所有模型的 H-step 预测）
 # =========================
 plt.figure()
-plt.plot(price_test.index, price_test.values, label='Actual')
-plt.plot(price_test.index, rw_preds.values, label='RW (benchmark)')
-plt.plot(price_test.index, arima_price_preds.values, label=f'ARIMA{arima_order}')
-if exog_train is not None and not np.isnan(mae_arimax):
-    plt.plot(price_test.index, arimax_price_preds.values, label=f'ARIMAX{arima_order} (macro)')
+plt.plot(price_test_H.index, price_test_H.values, label='Actual')
+plt.plot(rw_preds.index, rw_preds.values, label='RW (benchmark)')
+plt.plot(arima_price_preds.index, arima_price_preds.values, label=f'ARIMA{arima_order}')
+if arimax_price_preds is not None and not np.isnan(mae_arimax):
+    plt.plot(arimax_price_preds.index, arimax_price_preds.values, label=f'ARIMAX{arima_order} (macro)')
 if prophet_preds is not None:
-    plt.plot(price_test.index, prophet_preds.values, label='Prophet')
-plt.title(f'{ticker} {H}-step forecasts (test set)')
+    plt.plot(prophet_preds.index, prophet_preds.values, label='Prophet')
+plt.title(f'{ticker} {H}-step ahead forecasts (test set)')
 plt.xlabel('Date')
 plt.ylabel('Price')
 plt.legend()
@@ -403,16 +449,15 @@ plt.show()
 
 # =========================
 # Figure 2b: Model comparison without RW (Results section)
-#   Focus on ARIMA vs ARIMAX vs Prophet
 # =========================
 plt.figure()
-plt.plot(price_test.index, price_test.values, label='Actual')
-plt.plot(price_test.index, arima_price_preds.values, label=f'ARIMA{arima_order}')
-if exog_train is not None and not np.isnan(mae_arimax):
-    plt.plot(price_test.index, arimax_price_preds.values, label=f'ARIMAX{arima_order} (macro)')
+plt.plot(price_test_H.index, price_test_H.values, label='Actual')
+plt.plot(arima_price_preds.index, arima_price_preds.values, label=f'ARIMA{arima_order}')
+if arimax_price_preds is not None and not np.isnan(mae_arimax):
+    plt.plot(arimax_price_preds.index, arimax_price_preds.values, label=f'ARIMAX{arima_order} (macro)')
 if prophet_preds is not None:
-    plt.plot(price_test.index, prophet_preds.values, label='Prophet')
-plt.title(f'{ticker} {H}-step price forecast comparison: univariate vs multivariate models')
+    plt.plot(prophet_preds.index, prophet_preds.values, label='Prophet')
+plt.title(f'{ticker} {H}-step ahead price forecast comparison: univariate vs multivariate models')
 plt.xlabel('Date')
 plt.ylabel('Price')
 plt.legend()
@@ -423,10 +468,10 @@ plt.show()
 # Figure 3: ARIMA vs Actual (Appendix)
 # =========================
 plt.figure()
-plt.plot(price_test.index, price_test.values, label='Actual')
-plt.plot(price_test.index, arima_price_preds.values, label=f'ARIMA{arima_order}')
-if exog_train is not None and not np.isnan(mae_arimax):
-    plt.plot(price_test.index, arimax_price_preds.values, label=f'ARIMAX{arima_order} (macro)')
+plt.plot(price_test_H.index, price_test_H.values, label='Actual')
+plt.plot(arima_price_preds.index, arima_price_preds.values, label=f'ARIMA{arima_order}')
+if arimax_price_preds is not None and not np.isnan(mae_arimax):
+    plt.plot(arimax_price_preds.index, arimax_price_preds.values, label=f'ARIMAX{arima_order} (macro)')
 plt.title(f'{ticker} ARIMA vs Actual (test set, {H}-step ahead)')
 plt.xlabel('Date')
 plt.ylabel('Price')
@@ -434,14 +479,13 @@ plt.legend()
 plt.tight_layout()
 plt.show()
 
-
+# =========================
+# Figure 4: Prophet vs Actual (Appendix, 若存在)
+# =========================
 if prophet_preds is not None:
-    # =========================
-    # Figure 4: Prophet vs Actual (Appendix)
-    # =========================
     plt.figure()
-    plt.plot(price_test.index, price_test.values, label='Actual')
-    plt.plot(price_test.index, prophet_preds.values, label='Prophet')
+    plt.plot(price_test_H.index, price_test_H.values, label='Actual')
+    plt.plot(prophet_preds.index, prophet_preds.values, label='Prophet')
     plt.title(f'{ticker} Prophet vs Actual (test set, {H}-step ahead)')
     plt.xlabel('Date')
     plt.ylabel('Price')
@@ -455,34 +499,18 @@ if prophet_preds is not None:
 rows = []
 
 # 随机游走
-rows.append((
-    "RW",
-    float(mae.item()),
-    float(rmse.item())
-))
+rows.append(("RW", float(mae), float(rmse)))
 
 # ARIMA
-rows.append((
-    "ARIMA",
-    float(mae_arima),
-    float(rmse_arima)
-))
+rows.append(("ARIMA", float(mae_arima), float(rmse_arima)))
 
 # ARIMAX（如果成功估计）
-if not np.isnan(mae_arimax):
-    rows.append((
-        "ARIMAX",
-        float(mae_arimax),
-        float(rmse_arimax)
-    ))
+if arimax_price_preds is not None and not np.isnan(mae_arimax):
+    rows.append(("ARIMAX", float(mae_arimax), float(rmse_arimax)))
 
 # Prophet（如果存在）
-if prophet_preds is not None:
-    rows.append((
-        "Prophet",
-        float(mae_pr),
-        float(rmse_pr)
-    ))
+if prophet_preds is not None and not np.isnan(mae_pr):
+    rows.append(("Prophet", float(mae_pr), float(rmse_pr)))
 
 metrics_df = pd.DataFrame(rows, columns=["Model", "MAE", "RMSE"]).set_index("Model")
 
@@ -491,41 +519,28 @@ print(metrics_df)
 print("==============================================\n")
 
 # =========================
-# Sanity check: show first few actual vs predicted values
+# Sanity check: show first few actual vs predicted values (H-step)
 # =========================
-print("\n===== Sanity check: first 5 observations (price space) =====")
+print("\n===== Sanity check: first 5 observations (H-step, price space) =====")
 
-sanity_cols = {"Actual": price_test.iloc[:5]}
-# 注意：逐个模型检查是否存在，再加入对比
-sanity_cols["RW"] = rw_preds.iloc[:5]
+first5_idx = price_test_H.index[:5]
+sanity_cols = {"Actual": price_test_H.loc[first5_idx]}
 
-sanity_cols["ARIMA"] = pd.Series(arima_price_preds.iloc[:5], index=price_test.iloc[:5].index, name="ARIMA")
+sanity_cols["RW"] = rw_preds.loc[first5_idx]
+sanity_cols["ARIMA"] = arima_price_preds.loc[first5_idx]
 
 if arimax_price_preds is not None and not np.isnan(mae_arimax):
-    sanity_cols["ARIMAX"] = pd.Series(
-        arimax_price_preds.iloc[:5],
-        index=price_test.iloc[:5].index,
-        name="ARIMAX"
-    )
+    common_idx_ax = first5_idx.intersection(arimax_price_preds.index)
+    sanity_cols["ARIMAX"] = arimax_price_preds.loc[common_idx_ax]
 
 if prophet_preds is not None:
-    sanity_cols["Prophet"] = pd.Series(
-        prophet_preds.iloc[:5],
-        index=price_test.iloc[:5].index,
-        name="Prophet"
-    )
+    common_idx_p5 = first5_idx.intersection(prophet_preds.index)
+    sanity_cols["Prophet"] = prophet_preds.loc[common_idx_p5]
 
- # Ensure everything is 1-D Series (avoid shape (5,1) issues)
-aligned_index = price_test.iloc[:5].index
-for k, v in sanity_cols.items():
-    # Convert to numpy array and flatten, then wrap back into a Series
-    arr = np.asarray(v).reshape(-1)
-    sanity_cols[k] = pd.Series(arr, index=aligned_index, name=k)
 sanity_df = pd.DataFrame(sanity_cols)
 print("\nRaw values (first 5):")
 print(sanity_df)
 
-# 打印各模型的前 5 个绝对误差，方便和 MAE/RMSE 对照
 print("\nAbsolute errors (first 5):")
 for col in sanity_df.columns:
     if col == "Actual":
@@ -542,14 +557,14 @@ if {"RW", "ARIMA"}.issubset(metrics_df.index):
 
     plt.figure()
     plt.bar(subset.index, subset["MAE"])
-    plt.title("MAE Comparison: RW vs ARIMA")
+    plt.title(f"MAE Comparison: RW vs ARIMA ({H}-step)")
     plt.ylabel("MAE")
     plt.tight_layout()
     plt.show()
 
     plt.figure()
     plt.bar(subset.index, subset["RMSE"])
-    plt.title("RMSE Comparison: RW vs ARIMA")
+    plt.title(f"RMSE Comparison: RW vs ARIMA ({H}-step)")
     plt.ylabel("RMSE")
     plt.tight_layout()
     plt.show()
@@ -559,14 +574,14 @@ if {"RW", "ARIMA"}.issubset(metrics_df.index):
 # =========================
 plt.figure()
 plt.bar(metrics_df.index, metrics_df["MAE"])
-plt.title("MAE Comparison across models")
+plt.title(f"MAE Comparison across models ({H}-step)")
 plt.ylabel("MAE")
 plt.tight_layout()
 plt.show()
 
 plt.figure()
 plt.bar(metrics_df.index, metrics_df["RMSE"])
-plt.title("RMSE Comparison across models")
+plt.title(f"RMSE Comparison across models ({H}-step)")
 plt.ylabel("RMSE")
 plt.tight_layout()
 plt.show()
