@@ -7,6 +7,8 @@ import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
 import statsmodels.api as sm
+# === 添加这一行：用于残差的正式白噪声检验 ===
+from statsmodels.stats.diagnostic import acorr_ljungbox
 try:
     from pandas_datareader import data as web
     HAS_FRED = True
@@ -352,8 +354,100 @@ if exog_train is not None:
         rmse_arimax = np.sqrt(np.mean(diff_arimax ** 2))
         print(f"ARIMAX{arima_order} MAE={mae_arimax:.6f}, RMSE={rmse_arimax:.6f}")
     except Exception as e:
-        print("ARIMAX 拟合失败:", e)
+        print("ARIMAX 拟合失败:", e) 
+# =======================================================
+# DIAGNOSTICS: ARIMA and ARIMAX Residual Analysis
+# =======================================================
+print("\n===== Running Residual Diagnostics for ARIMA and ARIMAX =====")
 
+def run_diagnostics(model_name, y_train, order, exog_train=None):
+    """
+    对给定的训练集和模型配置运行残差诊断并绘图。
+    适用于 ARIMA 和 ARIMAX。
+    """
+    try:
+        if exog_train is not None:
+            # 使用 SARIMAX 拟合 ARIMAX
+            model = sm.tsa.SARIMAX(
+                y_train,
+                order=order,
+                exog=exog_train,
+                enforce_stationarity=False,
+                enforce_invertibility=False,
+            )
+        else:
+            # 使用 ARIMA 拟合 Simple ARIMA
+            model = sm.tsa.ARIMA(y_train, order=order)
+        
+        # 拟合最终模型到整个训练集
+        res = model.fit(disp=False)
+        resid = res.resid
+        resid_sq = resid**2
+        
+        print(f"\n[Diagnostics] Successfully fitted final {model_name} model.")
+# --- 3. Descriptive Statistics (Mean and Std Dev) ---
+        resid_mean = resid.mean()
+        resid_std = resid.std()
+        
+        print(f"\n{model_name} Residual Descriptive Statistics:")
+        print(f"    Mean (should be near 0): {resid_mean:.6f}")
+        print(f"    Standard Deviation: {resid_std:.6f}")
+        
+        # ... [ACF/PACF 绘图代码继续] ...
+        # --- 1. ACF/PACF of residuals (White Noise Check) ---
+        fig, axes = plt.subplots(2, 1, figsize=(10, 6))
+        # 
+        sm.graphics.tsa.plot_acf(resid, lags=40, ax=axes[0], title=f'{model_name} Residual ACF (White Noise Check)')
+        sm.graphics.tsa.plot_pacf(resid, lags=40, ax=axes[1], title=f'{model_name} Residual PACF')
+       
+        # <<< 关键调整：设置 Y 轴刻度，放大相关性 >>>
+        axes[0].set_ylim([-0.05, 0.05]) 
+        axes[1].set_ylim([-0.05, 0.05])
+
+        plt.tight_layout()
+        plt.savefig(f"{model_name}_Residuals_ACF_PACF.png")
+        plt.show()
+
+        # --- 2. ACF/PACF of squared residuals (Volatility Clustering / GARCH Check) ---
+        fig, axes = plt.subplots(2, 1, figsize=(10, 6))
+        # 
+        sm.graphics.tsa.plot_acf(resid_sq, lags=40, ax=axes[0], title=f'{model_name} Squared Residuals ACF (GARCH Check)')
+        sm.graphics.tsa.plot_pacf(resid_sq, lags=40, ax=axes[1], title=f'{model_name} Squared Residuals PACF')
+       
+       # <<< 关键调整：设置 Y 轴刻度，放大平方残差相关性 >>>
+        axes[0].set_ylim([-0.05, 0.05]) 
+        axes[1].set_ylim([-0.05, 0.05])
+       
+        plt.tight_layout()
+        plt.savefig(f"{model_name}_SquaredResiduals_ACF_PACF.png")
+        plt.show()
+
+        # --- 3. Ljung-Box Test (Formal White Noise Test) ---
+        # 仅在残差序列长度足够时执行（确保不会因数据过少报错）
+        if len(resid) > 10:
+            lb_test = sm.stats.acorr_ljungbox(resid, lags=[10], return_df=True)
+            print(f"{model_name} Ljung-Box Test (p-value for no autocorrelation):")
+            print(lb_test)
+
+    except Exception as e:
+        print(f"[Error] {model_name} Residual Diagnostics failed: {e}")
+        
+# -------------------------------------------------------
+# 运行诊断
+# -------------------------------------------------------
+
+# 1. 诊断 Simple ARIMA
+run_diagnostics("ARIMA", log_train, arima_order)
+
+# 2. 诊断 ARIMAX (需要确保 exog_train 已成功创建)
+# 注意：这里使用修正后的逻辑，exog_train 应该是水平值 (levels)
+# 确保你已经修正了前面代码中对 exog_train 的赋值，使其为水平值！
+if exog_train is not None and not exog_train.empty:
+    run_diagnostics("ARIMAX", log_train, arima_order, exog_train=exog_train)
+else:
+    print("ARIMAX Diagnostics skipped: Exogenous variables not available.")
+
+print("=======================================================\n")
 # 如可用，计算 Prophet 的滚动一步预测
 prophet_preds = None
 if HAS_PROPHET:
